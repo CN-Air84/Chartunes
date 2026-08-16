@@ -725,10 +725,16 @@ class MalodyClient(_BaseClient):
 
     # -- 搜索（两段式） ------------------------------------------------------
     def search(self, q: str) -> list[SongInfo]:
-        """按关键词搜歌（type=1）。返回歌曲级列表。"""
+        """按关键词搜歌（type=1）。返回歌曲级列表。
+
+        服务器侧无任何难度的死条目（mode_mask=0，uptime=0，实测占比很高）
+        直接过滤——对"只想听歌"的调用方它们毫无价值。
+        """
         data = self._cgi("/cgi/list", {"type": 1, "word": q, "org": 1})
         songs = []
         for e in data if isinstance(data, list) else []:
+            if e.get("mode") == 0:                    # 无谱死条目
+                continue
             cover = e.get("cover") or ""
             songs.append(SongInfo(
                 platform="malody",
@@ -765,6 +771,22 @@ class MalodyClient(_BaseClient):
                 _client=self,
             ))
         return out
+
+    def default_chart(self, song: SongInfo) -> ChartInfo:
+        """取该歌曲难度列表中的最低难度谱面（一键听歌用，免选难度）。
+
+        按 version 字段里的 ``Lv.<数字>`` 数值取最小（如 ``4K Easy Lv.7``），
+        无 Lv 数值时退回列表首个（服务器通常按难度升序返回）。
+        """
+        charts = self.charts(song)
+        if not charts:
+            raise NotFoundError(f"{song.title}：服务器侧没有任何难度")
+
+        def level_key(c: ChartInfo) -> tuple[int, int]:
+            m = re.search(r"Lv\.?\s*(\d+)", str(c.difficulty or ""))
+            return (0, int(m.group(1))) if m else (1, 0)
+
+        return min(charts, key=level_key)
 
     # -- 下载 ------------------------------------------------------------
     def _manifest(self, chart: ChartInfo) -> dict:

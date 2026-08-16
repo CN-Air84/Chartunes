@@ -11,9 +11,10 @@ UI 骨架与自绘控件 skid 自 YuanyueTTS 的流媒体选项卡（streaming_p
 - 布局：顶栏搜索 + 左侧平台栏 + 右侧卡片式结果列表 + 底部试听播放栏；
 - 搜索：点击结果行标题 = 试听（下载到 ./cache/ 后经独立子进程播放），
   「+」= 加入下载队列（./downloads/<平台>/）；
-  Malody 为歌曲行 → 点击展开难度子行 → 对难度行试听/下载；
-- 登录：右上角「👤 登录」打开覆盖面板（osu! 粘贴 Cookie / Phira 浏览器
-  收割 / Malody 账密），凭证缓存在 ~/.chartunes/state.json；
+  Malody 结果为歌曲行，试听/下载时自动解析为最低难度谱面，
+  无谱死条目已在模块层（chartunes.search）过滤；
+- 登录：右上角「👤 登录」打开覆盖面板（osu!/Phira 粘贴 Cookie 或 Phira
+  浏览器收割 / Malody 账密），凭证缓存在 ~/.chartunes/state.json；
 - 播放：底部栏 ⏮ ⏯ ⏭ ⏹ + 进度条（可拖动 seek）+ 音量（长按静音）。
 """
 from __future__ import annotations
@@ -24,6 +25,7 @@ import subprocess
 import sys
 import threading
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import chartunes as ct
@@ -60,7 +62,10 @@ DOWNLOAD_DIR = Path("downloads")
 CACHE_DIR = Path("cache")                                        # 试听缓存
 
 PLATFORMS = ["phira", "osu", "malody"]
-PLATFORM_CN = {"phira": "Phira", "osu": "osu!", "malody": "Malody"}
+PLATFORM_CN = {"phira": "Phira", "osu": "osu!", "malody": "Malody",
+               "agg": "聚合搜索"}
+AGG_KEY = "agg"                     # 聚合视图的伪平台键（三源混排）
+AGG_PER_SOURCE = 10                 # 聚合时每源最多取多少条
 LOGIN_URL = {"phira": "https://phira.moe/"}     # 仅 Phira 走浏览器收割
 
 # 主题（skid 自流媒体选项卡的默认配色）
@@ -465,18 +470,17 @@ class VolumeButton(QPushButton):
 class ChartItemWidget(QFrame):
     """单个谱面/歌曲/队列条目卡片。
 
-    - kind="chart"：+ 按钮加入下载队列；点击标题卡 = 试听；
-    - kind="song"（Malody 歌曲行）：点击标题卡 = 展开/收起难度子行；
-    - kind="queue"：- 按钮从队列移除；下载完成后点击标题卡 = 试听产物。
+    kind="chart" 与 kind="song"（Malody 歌曲行，试听/下载时自动解析为
+    最低难度谱面）行为一致：+ 加入下载队列；点击标题卡 = 试听。
+    kind="queue"：- 从队列移除；下载完成后点击标题卡 = 试听产物。
     """
-    preview_clicked = pyqtSignal(object)        # 请求试听 (chart, path_hint)
-    expand_requested = pyqtSignal(object)       # 请求展开 Malody 难度 (song)
-    add_queue_requested = pyqtSignal(object)    # 请求加入下载队列 (chart)
+    preview_clicked = pyqtSignal(object)        # 请求试听 (chart 或 song)
+    add_queue_requested = pyqtSignal(object)    # 请求加入下载队列
     remove_requested = pyqtSignal(int)          # 请求移除队列项 (index)
     copy_id_requested = pyqtSignal(str)         # 副文本点击复制 ID
 
     def __init__(self, kind, title, subtitle, tail="", obj=None,
-                 index=-1, indent=False, enabled=True, parent=None):
+                 index=-1, indent=False, parent=None):
         super().__init__(parent)
         configure_transparent_container(self)
         self.kind = kind
@@ -507,21 +511,16 @@ class ChartItemWidget(QFrame):
             QPushButton:pressed { background-color: #e0e0e0; }
         """
 
-        # 1. 功能按钮：队列内 - / 谱面 + / 歌曲行禁用
+        # 1. 功能按钮：队列内 - / 其余 +
         if kind == "queue":
             self.action_btn = QPushButton("-")
             self.action_btn.setToolTip("从队列移除")
             extra = ("background-color: rgb(255, 120, 120); color: white; "
                      "border: 1px solid #CC0000;")
             self.action_btn.clicked.connect(lambda: self.remove_requested.emit(self.index))
-        elif kind == "song":
-            self.action_btn = QPushButton("·")
-            self.action_btn.setToolTip("歌曲行：点击标题展开难度")
-            extra = ("background-color: #f2f2f2; color: #999999; "
-                     "border: 1px solid #DDDDDD;")
         else:
             self.action_btn = QPushButton("+")
-            self.action_btn.setToolTip("加入下载队列")
+            self.action_btn.setToolTip("加入下载队列（Malody 自动取最低难度）")
             extra = "background-color: white; color: #333333; border: 1px solid gray;"
             self.action_btn.clicked.connect(lambda: self.add_queue_requested.emit(self.obj))
         configure_semantic_surface(self.action_btn)
@@ -529,8 +528,6 @@ class ChartItemWidget(QFrame):
         self.action_btn.setCursor(Qt.PointingHandCursor)
         self.action_btn.setStyleSheet(
             BTN_STYLE + f"QPushButton {{ font-size: 22px; font-weight: bold; {extra} }}")
-        if kind == "song" or not enabled:
-            self.action_btn.setEnabled(False)
         layout.addWidget(self.action_btn)
 
         # 2. 标题卡（点击 = 试听 / 展开难度）
@@ -604,19 +601,10 @@ class ChartItemWidget(QFrame):
             f"font-family: '{FONT_FAMILY}'; border: none;")
 
     def _on_title_clicked(self):
-        if self.kind == "song":
-            self.expand_requested.emit(self.obj)
-        else:
-            self.preview_clicked.emit(self.obj)
+        self.preview_clicked.emit(self.obj)
 
     def _show_context_menu(self, pos):
         menu = QMenu(self)
-        if self.kind == "song":
-            act_toggle = menu.addAction("展开/收起难度")
-            action = menu.exec_(self.mapToGlobal(pos))
-            if action == act_toggle:
-                self.expand_requested.emit(self.obj)
-            return
         act_add = menu.addAction("加入下载队列")
         act_preview = menu.addAction("试听")
         if self.obj is not None:
@@ -777,11 +765,31 @@ class LoginOverlay(QWidget):
         v = QVBoxLayout(block)
         v.setContentsMargins(18, 12, 18, 12)
         v.setSpacing(6)
-        v.addWidget(self._section_title("Phira（浏览器收割，可选）"))
+        v.addWidget(self._section_title("Phira（可选）"))
         v.addWidget(self._hint_label(
-            "打开浏览器到 phira.moe，手动完成登录后收割 cookie。"
-            "不登录也能搜索下载（免登录通道）。"))
-        self.phira_btn = QPushButton("打开浏览器登录")
+            "不登录也能搜索下载（免登录通道）。遇风控收紧时二选一："))
+        # 方式一：手动粘贴 cookie（即时生效，推荐）
+        row = QHBoxLayout()
+        row.setSpacing(8)
+        self.phira_input = QLineEdit()
+        self.phira_input.setPlaceholderText("手动粘贴 Cookie：name1=value1; name2=value2 …")
+        self.phira_input.setStyleSheet(
+            f"QLineEdit {{ border: 1px solid #BBBBBB; border-radius: 6px; "
+            f"padding: 6px 8px; font-size: 13px; font-family: '{FONT_FAMILY}'; }}")
+        row.addWidget(self.phira_input, 1)
+        save_btn = QPushButton("保存")
+        save_btn.setFixedHeight(34)
+        save_btn.setCursor(Qt.PointingHandCursor)
+        save_btn.setStyleSheet(
+            f"QPushButton {{ background-color: {ACCENT}; color: white; "
+            f"border-radius: 6px; padding: 0 16px; font-size: 14px; "
+            f"font-family: '{FONT_FAMILY}'; }}"
+            "QPushButton:hover { background-color: #4f84de; }")
+        save_btn.clicked.connect(self._save_phira_cookie)
+        row.addWidget(save_btn)
+        v.addLayout(row)
+        # 方式二：selenium 有头浏览器收割（慢但省事）
+        self.phira_btn = QPushButton("打开浏览器登录（慢）")
         self.phira_btn.setFixedHeight(34)
         self.phira_btn.setCursor(Qt.PointingHandCursor)
         self.phira_btn.setStyleSheet(
@@ -795,6 +803,16 @@ class LoginOverlay(QWidget):
             self.phira_btn.setToolTip("未安装 selenium：pip install selenium")
         v.addWidget(self.phira_btn)
         return block
+
+    def _save_phira_cookie(self):
+        cookie = self.phira_input.text().strip()
+        if cookie.lower().startswith("cookie:"):     # 用户连前缀一起抄了
+            cookie = cookie[7:].strip()
+        if "=" not in cookie:
+            QMessageBox.warning(self, "格式不对",
+                                "看着不像 Cookie（应形如 name1=value1; name2=value2）")
+            return
+        self.phira_cookie_ready.emit(cookie)
 
     def _build_malody_block(self):
         block = QFrame()
@@ -964,7 +982,6 @@ class _Signals(QObject):
     auth_required = pyqtSignal(str)             # 需要登录某平台
     search_done = pyqtSignal(str, object, int)  # platform, rows, total
     search_failed = pyqtSignal(str)             # 错误消息（含遮罩关闭）
-    charts_loaded = pyqtSignal(str, object, object)   # song_id, charts, error
     preview_ready = pyqtSignal(object, str, str)      # chart, path, error
     queue_changed = pyqtSignal()                # 下载队列状态变化
     playback_ended = pyqtSignal()               # 试听自然结束
@@ -991,7 +1008,6 @@ class ChartunesWindow(QMainWindow):
         self._view_platform = "phira"            # 当前平台视图
         self._view_queue = False                 # 是否显示下载队列视图
         self._results: dict[str, list] = {}      # platform -> [(kind, obj)]
-        self._expanded: dict[str, list] = {}     # malody song_id -> charts
         self._rows: list = []                    # 当前渲染的行 spec 队列
         self._render_next = 0
         self._render_token = 0
@@ -1041,7 +1057,7 @@ class ChartunesWindow(QMainWindow):
         threading.Thread(target=self._queue_worker, daemon=True).start()
 
         self._refresh_platform_panel()
-        self._log("就绪。试听点击曲名，下载点 + ；Malody 先点曲名展开难度。", False)
+        self._log("就绪。点曲名试听、点 + 入队下载；Malody 自动取最低难度。", False)
 
     # ---------------------------------------------------------------- 状态存取
     def _load_state(self) -> dict:
@@ -1086,7 +1102,6 @@ class ChartunesWindow(QMainWindow):
         self.sig.auth_required.connect(self._on_auth_required)
         self.sig.search_done.connect(self._on_search_done)
         self.sig.search_failed.connect(self._on_search_failed)
-        self.sig.charts_loaded.connect(self._on_charts_loaded)
         self.sig.preview_ready.connect(self._on_preview_ready)
         self.sig.queue_changed.connect(self._on_queue_changed)
         self.sig.playback_ended.connect(self._play_next_preview)
@@ -1176,6 +1191,14 @@ class ChartunesWindow(QMainWindow):
         left_v = QVBoxLayout(self.left_outer)
         left_v.setContentsMargins(10, 10, 10, 10)
         left_v.setSpacing(8)
+
+        self.agg_btn = QPushButton()
+        self.agg_btn.setFixedHeight(56)
+        self.agg_btn.setCheckable(True)
+        self.agg_btn.setCursor(Qt.PointingHandCursor)
+        self.agg_btn.setToolTip("同时搜索三个平台并把结果混排在一起")
+        self.agg_btn.clicked.connect(lambda: self.switch_platform(AGG_KEY))
+        left_v.addWidget(self.agg_btn)
 
         self.platform_btns: dict[str, QPushButton] = {}
         for p in PLATFORMS:
@@ -1445,6 +1468,20 @@ class ChartunesWindow(QMainWindow):
         super().resizeEvent(event)
         self._apply_responsive_scale()
 
+    def showEvent(self, event):
+        """窗口首次显示后挂接屏幕切换信号（windowHandle 此时才存在）。"""
+        super().showEvent(event)
+        handle = self.windowHandle()
+        if handle is not None and not getattr(self, "_screen_hooked", False):
+            self._screen_hooked = True
+            handle.screenChanged.connect(self._on_screen_changed)
+
+    def _on_screen_changed(self, _screen) -> None:
+        """跨屏拖动后 DPR 变化：重算等比缩放并强制重绘全部自绘控件。"""
+        self._apply_responsive_scale()
+        for w in self.findChildren(QWidget):
+            w.update()
+
     # ------------------------------------------------------------ 线程投递
     def _thread(self, fn) -> None:
         def run():
@@ -1465,6 +1502,9 @@ class ChartunesWindow(QMainWindow):
         if not q:
             return
         platform = self._view_platform
+        if platform == AGG_KEY:
+            self._aggregate_search(q)
+            return
         self._log(f"[{PLATFORM_CN[platform]}] 搜索：{q}")
         self.loading_overlay.show_loading(f"正在搜索 {PLATFORM_CN[platform]}…")
 
@@ -1494,6 +1534,51 @@ class ChartunesWindow(QMainWindow):
 
         self._thread(work)
 
+    def _aggregate_search(self, q: str) -> None:
+        """聚合搜索：三源并发，未登录/失败的源跳过（不打断），结果混排。"""
+        self._log(f"[聚合] 三源并发搜索：{q}")
+        self.loading_overlay.show_loading("正在聚合搜索三个平台…")
+
+        def search_one(p: str):
+            try:
+                client = self.get_client(p)
+                if p == "malody":
+                    songs = client.search(q)        # 死条目已在模块层过滤
+                    return p, [("song", s) for s in songs[:AGG_PER_SOURCE]], None
+                if p == "osu":
+                    page = client.search(q, include_covers=True)
+                else:
+                    page = client.search(q)
+                return p, [("chart", c) for c in page.items[:AGG_PER_SOURCE]], None
+            except ct.AuthError as e:
+                return p, [], f"[聚合] 跳过 {PLATFORM_CN[p]}：{e}"
+            except Exception as e:                   # noqa: BLE001
+                return p, [], f"[聚合] {PLATFORM_CN[p]} 失败：{e}"
+
+        def work():
+            with ThreadPoolExecutor(max_workers=len(PLATFORMS)) as ex:
+                results = list(ex.map(search_one, PLATFORMS))
+            rows: list = []
+            notes: list = []
+            per_source: dict[str, int] = {}
+            for p, r, err in results:
+                rows.extend(r)
+                per_source[p] = len(r)
+                if err:
+                    notes.append(err)
+            if not rows:
+                self.sig.search_failed.emit("聚合搜索：三个平台都没有可用结果")
+                for n in notes:
+                    self.sig.log.emit(n, True)
+                return
+            hits = "，".join(f"{PLATFORM_CN[p]} {n}" for p, n in per_source.items() if n)
+            self.sig.log.emit(f"[聚合] {hits}", False)
+            for n in notes:                          # 跳过/失败源放后面提示
+                self.sig.log.emit(n, True)
+            self.sig.search_done.emit(AGG_KEY, rows, len(rows))
+
+        self._thread(work)
+
     def _on_search_failed(self, message: str) -> None:
         self.loading_overlay.hide_loading()
         self._on_log(message, True)
@@ -1502,78 +1587,27 @@ class ChartunesWindow(QMainWindow):
         self.loading_overlay.hide_loading()
         self._results[platform] = rows
         self.switch_platform(platform)               # 渲染新结果
+        if platform == AGG_KEY:
+            return                                  # 聚合的分源统计已在 worker 里打印
         hits = len(rows)
         if platform == "malody":
             self._log(f"命中 {hits} 首歌（点击曲名展开难度）")
         else:
             self._log(f"命中 {hits} 条（total={total}）")
 
-    # ------------------------------------------------------------ Malody 难度
-    def _on_expand_requested(self, song) -> None:
-        song_id = str(song.song_id)
-        if song_id in self._expanded:                # 已展开 → 收起
-            del self._expanded[song_id]
-            self._refresh_rows()
-            return
-        if song.extra.get("mode_mask") == 0:
-            self._log(f"[Malody] {song.title}：服务器侧无任何难度"
-                      f"（mode_mask=0 死条目），换一首试试", True)
-            return
-        self._log(f"[Malody] 加载难度：{song.title} (sid={song_id})")
-        self.loading_overlay.show_loading("正在加载难度…")
-
-        def work():
-            try:
-                client = self.get_client("malody")
-                charts = client.charts(song)
-            except ct.AuthError as e:
-                self.sig.charts_loaded.emit(song_id, None, str(e))
-                self.sig.auth_required.emit("malody")
-                return
-            except Exception as e:                   # noqa: BLE001
-                self.sig.charts_loaded.emit(song_id, None, f"加载难度失败：{e}")
-                return
-            self.sig.charts_loaded.emit(song_id, charts, "")
-
-        self._thread(work)
-
-    def _on_charts_loaded(self, song_id: str, charts, error: str) -> None:
-        self.loading_overlay.hide_loading()
-        if error:
-            self._on_log(error, True)
-            return
-        if not charts:
-            self._log("该曲 0 个难度（服务器侧无谱，换一首试试）", True)
-            return
-        self._expanded[song_id] = charts
-        self._refresh_rows()
-        self._log(f"该曲 {len(charts)} 个难度已列出")
-
     # ------------------------------------------------------------ 行渲染
     @staticmethod
     def _chart_row(chart) -> dict:
-        subtitle = chart.artist or ""
-        tail = ""
-        if chart.platform == "malody":
-            subtitle = f"{chart.artist} | 定谱 {chart.charter}" if chart.charter else chart.artist
-            pc = chart.extra.get("pc")
-            tail = f"pc={pc}" if pc else ""
-        elif chart.platform == "phira":
-            level = chart.extra.get("level")
-            subtitle = f"{chart.artist} | {level}" if level else chart.artist
-        elif chart.difficulty:
-            subtitle = f"{chart.artist} | {chart.difficulty}"
+        # 只留作者与谱面 id——听歌用，难度/定数等元数据没有意义
         return {"kind": "chart", "obj": chart, "title": chart.title,
-                "subtitle": subtitle or "—", "tail": tail or str(chart.chart_id)[:10]}
+                "subtitle": chart.artist or "—",
+                "tail": str(chart.chart_id)[:10]}
 
     @staticmethod
     def _song_row(song) -> dict:
-        dead = song.extra.get("mode_mask") == 0
-        return {"kind": "song", "obj": song,
-                "title": song.title + ("　[无谱]" if dead else ""),
-                "subtitle": (f"{song.artist} | bpm={song.bpm} "
-                             f"{song.duration or '?'}s"),
-                "tail": ""}
+        return {"kind": "song", "obj": song, "title": song.title,
+                "subtitle": song.artist or "—",
+                "tail": str(song.song_id)[:10]}
 
     def _current_rows(self) -> list:
         if self._view_queue:
@@ -1581,25 +1615,20 @@ class ChartunesWindow(QMainWindow):
             for i, item in enumerate(self._queue):
                 chart = item["chart"]
                 rows.append({
-                    "kind": "queue", "obj": chart, "index": i,
+                    "kind": "queue", "obj": item.get("src") or chart, "index": i,
                     "title": chart.title,
-                    "subtitle": f"{PLATFORM_CN[chart.platform]} | {chart.artist}",
+                    "subtitle": f"{PLATFORM_CN[chart.platform]} | {chart.artist or '—'}",
                     "tail": item["status"],
                     "item": item,
                 })
             return rows
+        agg = self._view_platform == AGG_KEY
         rows = []
         for kind, obj in self._results.get(self._view_platform, []):
-            if kind == "song":
-                rows.append(self._song_row(obj))
-                song_id = str(obj.song_id)
-                if song_id in self._expanded:
-                    for chart in self._expanded[song_id]:
-                        spec = self._chart_row(chart)
-                        spec["indent"] = True
-                        rows.append(spec)
-            else:
-                rows.append(self._chart_row(obj))
+            spec = self._song_row(obj) if kind == "song" else self._chart_row(obj)
+            if agg and kind != "song":             # 聚合视图用 tail 标记来源平台
+                spec["tail"] = PLATFORM_CN.get(obj.platform, obj.platform)
+            rows.append(spec)
         return rows
 
     def _refresh_rows(self) -> None:
@@ -1626,7 +1655,7 @@ class ChartunesWindow(QMainWindow):
                 w.deleteLater()
                 self._render_disposals.append(w)
         if not rows:
-            hint = QLabel("输入关键词回车搜索；Malody 需先点曲名展开难度" if not self._view_queue
+            hint = QLabel("输入关键词回车搜索" if not self._view_queue
                           else "队列为空：在搜索结果里点 + 加入下载")
             hint.setAlignment(Qt.AlignCenter)
             hint.setStyleSheet(
@@ -1645,7 +1674,6 @@ class ChartunesWindow(QMainWindow):
                 obj=spec.get("obj"), index=spec.get("index", -1),
                 indent=spec.get("indent", False))
             widget.preview_clicked.connect(self._on_preview_clicked)
-            widget.expand_requested.connect(self._on_expand_requested)
             widget.add_queue_requested.connect(self._enqueue_download)
             widget.remove_requested.connect(self._remove_queue_item)
             widget.copy_id_requested.connect(self._copy_id)
@@ -1698,6 +1726,9 @@ class ChartunesWindow(QMainWindow):
             }}
             QPushButton:hover {{ background-color: #eef3fd; }}
         """
+        agg_active = (not self._view_queue and self._view_platform == AGG_KEY)
+        self.agg_btn.setChecked(agg_active)
+        self.agg_btn.setStyleSheet(active_style if agg_active else idle_style)
         for p, btn in self.platform_btns.items():
             active = (not self._view_queue and p == self._view_platform)
             btn.setChecked(active)
@@ -1711,6 +1742,7 @@ class ChartunesWindow(QMainWindow):
             "phira": ("● 已登录" if self.state.get("phira_cookie") else "○ 免登录"),
             "malody": ("● 已登录" if self.state.get("malody_key") else "○ 未登录"),
         }
+        self.agg_btn.setText("✦ 聚合搜索   三源合一")
         for p, btn in self.platform_btns.items():
             btn.setText(f"{PLATFORM_CN[p]}   {texts[p]}")
         pending = sum(1 for it in self._queue if it["status"] in (QUEUE_PENDING, QUEUE_RUNNING))
@@ -1732,20 +1764,27 @@ class ChartunesWindow(QMainWindow):
             self._log(f"打开目录失败：{e}（路径 {path}）", True)
 
     # ---------------------------------------------------------------- 下载队列
-    def _enqueue_download(self, chart) -> None:
-        key = (chart.platform, str(chart.chart_id))
+    @staticmethod
+    def _queue_key_of(obj) -> tuple:
+        """队列去重键：SongInfo 用 song 前缀（与解析后的难度不撞）。"""
+        if isinstance(obj, ct.SongInfo):
+            return ("malody", f"song-{obj.song_id}")
+        return (obj.platform, str(obj.chart_id))
+
+    def _enqueue_download(self, obj) -> None:
+        key = self._queue_key_of(obj)
         if key in self._queue_keys:
             self._log("已在下载队列中", False)
             return
         self._queue_keys.add(key)
         self._queue.append({
-            "chart": chart, "status": QUEUE_PENDING, "message": "",
+            "chart": obj, "src": obj, "status": QUEUE_PENDING, "message": "",
             "path": None,
             "want_cover": self.cover_checkbox.isChecked(),
         })
         self._queue_wakeup.set()
         self._on_queue_changed()
-        self._log(f"已加入队列：{chart.title}")
+        self._log(f"已加入队列：{obj.title}")
 
     def _remove_queue_item(self, index: int) -> None:
         if not (0 <= index < len(self._queue)):
@@ -1754,13 +1793,12 @@ class ChartunesWindow(QMainWindow):
         if item["status"] == QUEUE_RUNNING:
             self._log("该条目正在下载，无法移除", True)
             return
-        key = (item["chart"].platform, str(item["chart"].chart_id))
-        self._queue_keys.discard(key)
+        self._queue_keys.discard(self._queue_key_of(item["src"]))
         self._queue.pop(index)
         self._on_queue_changed()
 
     def _queue_worker(self) -> None:
-        """常驻串行下载线程。"""
+        """常驻串行下载线程。SongInfo 在此解析为最低难度谱面。"""
         while not self._closing:
             item = next((it for it in self._queue if it["status"] == QUEUE_PENDING), None)
             if item is None:
@@ -1769,10 +1807,13 @@ class ChartunesWindow(QMainWindow):
                 continue
             item["status"] = QUEUE_RUNNING
             self.sig.queue_changed.emit()
-            chart = item["chart"]
-            tag = f"[{PLATFORM_CN[chart.platform]}] {chart.title}"
             try:
-                client = self.get_client(chart.platform)
+                client = self.get_client(item["chart"].platform)
+                if isinstance(item["chart"], ct.SongInfo):
+                    # Malody 歌曲行：自动取最低难度
+                    item["chart"] = client.default_chart(item["chart"])
+                chart = item["chart"]
+                tag = f"[{PLATFORM_CN[chart.platform]}] {chart.title}"
                 out = DOWNLOAD_DIR / chart.platform
                 if chart.platform == "malody":
                     self.sig.log.emit(f"{tag} 下载整包（cid={chart.chart_id}）…", False)
@@ -1800,12 +1841,12 @@ class ChartunesWindow(QMainWindow):
             except ct.AuthError as e:
                 item["status"] = QUEUE_FAILED
                 item["message"] = str(e)
-                self.sig.log.emit(f"{tag} 失败：{e}", True)
-                self.sig.auth_required.emit(chart.platform)
+                self.sig.log.emit(f"{item['chart'].title} 失败：{e}", True)
+                self.sig.auth_required.emit(item["chart"].platform)
             except Exception as e:                   # noqa: BLE001
                 item["status"] = QUEUE_FAILED
                 item["message"] = str(e)
-                self.sig.log.emit(f"{tag} 失败：{e}", True)
+                self.sig.log.emit(f"{item['chart'].title} 失败：{e}", True)
             self.sig.queue_changed.emit()
 
     def _on_queue_changed(self) -> None:
@@ -1814,30 +1855,39 @@ class ChartunesWindow(QMainWindow):
             self._refresh_rows()
 
     # ---------------------------------------------------------------- 试听
-    def _on_preview_clicked(self, chart) -> None:
+    def _on_preview_clicked(self, obj) -> None:
         # 队列视图里点击已完成的条目：直接试听产物文件
         if self._view_queue:
             for item in self._queue:
-                if item["chart"] is chart:
+                if item.get("src") is obj or item["chart"] is obj:
                     if item["path"]:
-                        self._preview_local(chart, item["path"])
+                        self._preview_local(item["chart"], item["path"])
                     else:
                         self._log("该条目尚未下载完成，稍后再试", True)
                     return
-        self._start_preview(chart)
+        self._start_preview(obj)
 
-    def _start_preview(self, chart) -> None:
-        key = (chart.platform, str(chart.chart_id))
-        cached = self._preview_paths.get(key)
-        if cached and Path(cached).exists():
-            self._preview_local(chart, cached)
-            return
-        tag = f"[{PLATFORM_CN[chart.platform]}] {chart.title}"
+    def _start_preview(self, obj) -> None:
+        """obj 为 ChartInfo 直接准备缓存；为 SongInfo（Malody）先解析最低难度。"""
+        fast_key = None if isinstance(obj, ct.SongInfo) \
+            else (obj.platform, str(obj.chart_id))
+        if fast_key:
+            cached = self._preview_paths.get(fast_key)
+            if cached and Path(cached).exists():
+                self._preview_local(obj, cached)
+                return
+        tag = f"[{PLATFORM_CN[obj.platform]}] {obj.title}"
         self._log(f"{tag} 准备试听（下载到缓存）…")
-        self.loading_overlay.show_loading(f"正在准备试听：{chart.title}")
+        self.loading_overlay.show_loading(f"正在准备试听：{obj.title}")
 
         def work():
             try:
+                if isinstance(obj, ct.SongInfo):
+                    client = self.get_client("malody")
+                    chart = client.default_chart(obj)     # 自动取最低难度
+                else:
+                    chart = obj
+                key = (chart.platform, str(chart.chart_id))
                 cache_dir = CACHE_DIR / chart.platform
                 cache_dir.mkdir(parents=True, exist_ok=True)
                 existing = list(cache_dir.glob(f"{chart.chart_id}.*"))
@@ -1848,11 +1898,11 @@ class ChartunesWindow(QMainWindow):
                     ef = client.download_music(chart)
                     path = str(ef.save(cache_dir / f"{chart.chart_id}.{ef.format or 'bin'}"))
             except ct.AuthError as e:
-                self.sig.preview_ready.emit(chart, "", str(e))
-                self.sig.auth_required.emit(chart.platform)
+                self.sig.preview_ready.emit(obj, "", str(e))
+                self.sig.auth_required.emit(obj.platform)
                 return
             except Exception as e:                   # noqa: BLE001
-                self.sig.preview_ready.emit(chart, "", f"试听准备失败：{e}")
+                self.sig.preview_ready.emit(obj, "", f"试听准备失败：{e}")
                 return
             self.sig.preview_ready.emit(chart, path, "")
 
@@ -2072,6 +2122,11 @@ class ChartunesWindow(QMainWindow):
 
 
 def main() -> None:
+    # 高 DPI / 跨屏缩放：这些属性必须在 QApplication 实例化之前设置，
+    # 否则在缩放率不同的屏幕间拖动窗口会出现位图拉伸模糊、控件错位。
+    os.environ.setdefault("QT_AUTO_SCREEN_SCALE_FACTOR", "1")
+    QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
+    QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
     app = QApplication(sys.argv)
     app.setFont(QFont(FONT_FAMILY, 10))
     win = ChartunesWindow()

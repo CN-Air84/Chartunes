@@ -264,10 +264,9 @@ class GuiApp:
         self.loaded_songs.clear()
 
     def _fill_songs(self, songs) -> None:
-        for s in songs:
-            dead = s.extra.get("mode_mask") == 0    # 无谱死条目（服务器侧无任何难度）
+        for s in songs:                     # 无谱死条目已在 chartunes.search 过滤
             iid = self.tree.insert("", "end", values=(
-                s.title + ("　[无谱]" if dead else ""), s.artist,
+                s.title, s.artist,
                 f"sid={s.song_id}  bpm={s.bpm}  {s.duration or '?'}s"))
             self.registry[iid] = ("song", s)
 
@@ -289,10 +288,6 @@ class GuiApp:
             return
         self.loaded_songs.add(iid)
         song = entry[1]
-        if song.extra.get("mode_mask") == 0:
-            self.log(f"[Malody] {song.title}：服务器侧无任何难度（mode_mask=0 的"
-                     f"死条目，uptime=0），换一首试试")
-            return
         self.log(f"[Malody] 加载难度：{song.title} (sid={song.song_id})")
         client = None
 
