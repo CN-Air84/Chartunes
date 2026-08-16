@@ -1,9 +1,11 @@
 # -*- coding: utf-8 -*-
-"""gui_qt / player / player_backend 的离线导入冒烟测试。
+"""gui_qt / player / player_backend 的离线导入与离屏冒烟测试。
 
 PyQt5 未安装时整文件跳过（gui-qt extra 可选）。
 """
 from __future__ import annotations
+
+import os
 
 import pytest
 
@@ -35,3 +37,43 @@ def test_gui_qt_module_importable():
     for attr in ("ChartunesWindow", "ChartItemWidget", "LoginOverlay",
                  "ScrollingLabel", "ElidedLabel", "VolumePopup", "main"):
         assert hasattr(gui_qt, attr), attr
+
+
+def _fake_chart():
+    return type("C", (), {"platform": "phira", "chart_id": 123, "title": "T",
+                          "artist": "A", "difficulty": "HD", "charter": None,
+                          "extra": {"level": "Lv.14"}})()
+
+
+def _fake_song():
+    return type("S", (), {"platform": "malody", "song_id": 456, "title": "Song",
+                          "artist": "AR", "bpm": 180, "duration": 95,
+                          "extra": {"mode_mask": 3}})()
+
+
+def test_aggregate_view_rendering():
+    """聚合视图：结果混排 + 行尾显示来源平台 + 左栏聚合按钮选中。"""
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    gui_qt = pytest.importorskip("gui_qt")
+    from PyQt5.QtTest import QTest
+    from PyQt5.QtWidgets import QApplication
+
+    app = QApplication.instance() or QApplication([])
+    win = gui_qt.ChartunesWindow()
+    try:
+        win._results[gui_qt.AGG_KEY] = [("chart", _fake_chart()), ("song", _fake_song())]
+        win.switch_platform(gui_qt.AGG_KEY)
+        QTest.qWait(80)                    # 等分批渲染的 1ms QTimer 跑完
+        assert win.list_title_label.text().startswith("聚合搜索")
+        assert win.agg_btn.isChecked()
+        rows = [win.song_layout.itemAt(i).widget()
+                for i in range(win.song_layout.count())]
+        tails = [w.tail_label.text() for w in rows
+                 if isinstance(w, gui_qt.ChartItemWidget)]
+        assert "Phira" in tails            # 聚合行的 tail 是来源平台名
+        # 屏幕切换钩子可直接调用（跨屏 DPR 变化时触发），不崩即可
+        win._on_screen_changed(None)
+        QTest.qWait(30)
+    finally:
+        win.close()
+        QTest.qWait(30)

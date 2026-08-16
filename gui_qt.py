@@ -2122,6 +2122,12 @@ class ChartunesWindow(QMainWindow):
 
 
 def main() -> None:
+    # PyInstaller 冻结复用：exe 以 --player-backend 启动时自身充当试听播放
+    # 子进程（必须在 QApplication 创建之前分流，播放进程不需要 Qt）
+    if "--player-backend" in sys.argv:
+        import player_backend
+        player_backend.run_stdin_loop()
+        return
     # 高 DPI / 跨屏缩放：这些属性必须在 QApplication 实例化之前设置，
     # 否则在缩放率不同的屏幕间拖动窗口会出现位图拉伸模糊、控件错位。
     os.environ.setdefault("QT_AUTO_SCREEN_SCALE_FACTOR", "1")

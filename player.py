@@ -36,14 +36,22 @@ class MusicPlayer:
 
     # ------------------------------------------------------------ 子进程管理
     def _start_backend(self) -> None:
-        """启动后台播放进程（隐藏 Windows 控制台窗口）。"""
+        """启动后台播放进程（隐藏 Windows 控制台窗口）。
+
+        源码环境：spawn ``python player_backend.py``；
+        PyInstaller 冻结环境：spawn exe 自身并附 ``--player-backend`` 参数
+        （gui_qt.main() 检测到该参数即转入播放子进程分支，不再启动 GUI）。
+        """
         try:
-            script = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                  "player_backend.py")
-            if not os.path.exists(script):
-                log.error("找不到 player_backend.py：%s", script)
-                return
-            args = [sys.executable, script]
+            if getattr(sys, "frozen", False):
+                args = [sys.executable, "--player-backend"]
+            else:
+                script = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                      "player_backend.py")
+                if not os.path.exists(script):
+                    log.error("找不到 player_backend.py：%s", script)
+                    return
+                args = [sys.executable, script]
 
             startupinfo = None
             if sys.platform == "win32":

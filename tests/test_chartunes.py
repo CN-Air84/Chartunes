@@ -163,16 +163,21 @@ class TestMalodyParse:
         monkeypatch.setattr(malody, "_cgi",
                             lambda path, params: load_json("step1_type1.json")["data"])
         songs = malody.search("Sakuzyo")
-        assert len(songs) == 132
+        # 132 条原始结果中 107 条是 mode_mask=0 的无谱死条目，模块层直接滤掉
+        assert len(songs) == 25
         first = songs[0]
         assert first.song_id == 536
         assert first.title == "AXION" and first.artist == "Sakuzyo"
         assert first.cover == ("http://cni.machart.top"
                                "/cover/536!small?time=1582298002")
-        # cover 为空的条目应保持 None
-        empty = next(s for s in songs if s.extra.get("st") == 1 and not s.cover)
-        assert empty.cover is None
         assert first.extra["mode_mask"] == 161
+
+    def test_song_search_filters_dead_entries(self, malody, monkeypatch):
+        """mode_mask=0 的死条目不应出现在搜索结果中。"""
+        monkeypatch.setattr(malody, "_cgi",
+                            lambda path, params: load_json("step1_type1.json")["data"])
+        songs = malody.search("Sakuzyo")
+        assert songs and all(s.extra.get("mode_mask") != 0 for s in songs)
 
     def test_difficulty_list(self, malody, monkeypatch):
         captured = {}
@@ -193,6 +198,23 @@ class TestMalodyParse:
         assert first.charter == "B-Leaf"
         assert first.difficulty == "4K Easy Lv.7"
         assert first.title == "AXION"                    # 冗余歌曲信息继承
+
+    def test_default_chart_picks_lowest_level(self, malody, monkeypatch):
+        """default_chart 按 version 里的 Lv 数值取最低难度。"""
+        monkeypatch.setattr(malody, "_cgi",
+                            lambda path, params: load_json("step1.json")["data"])
+        song = ct.SongInfo(platform="malody", song_id=536, title="AXION",
+                           artist="Sakuzyo", extra={"_word": "Sakuzyo"})
+        chart = malody.default_chart(song)
+        assert chart.chart_id == 115257                  # 4K Easy Lv.7（并列最低取首个）
+        assert chart.difficulty == "4K Easy Lv.7"
+
+    def test_default_chart_empty_raises(self, malody, monkeypatch):
+        monkeypatch.setattr(malody, "_cgi", lambda path, params: [])
+        song = ct.SongInfo(platform="malody", song_id=1, title="X",
+                           artist="Y", extra={})
+        with pytest.raises(ct.NotFoundError):
+            malody.default_chart(song)
 
     def test_manifest_pattern(self):
         """file == hash[:12]，hash 为 md5。"""

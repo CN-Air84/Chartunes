@@ -264,7 +264,12 @@ class PlaybackBackend:
             pass
 
 
-if __name__ == "__main__":
+def run_stdin_loop() -> None:
+    """主循环：逐行读取 stdin 命令（供 exe 复用分支与 ``python -m`` 调用）。"""
     backend = PlaybackBackend()
     for line in sys.stdin:
         backend.handle_command(line)
+
+
+if __name__ == "__main__":
+    run_stdin_loop()
