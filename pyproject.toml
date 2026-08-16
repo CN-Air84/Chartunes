@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "chartunes"
+version = "0.1.0"
+description = "从音游谱面包中搜索、下载并提取音乐文件（osu! / Phira / Malody）"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+dependencies = ["httpx>=0.27"]
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+# tkinter 轻量界面（gui.py）
+gui = ["selenium>=4.15"]
+# PyQt5 精美界面（gui_qt.py，skid 自 YuanyueTTS 流媒体选项卡）：
+# PyQt5 = 界面本体；pygame = 试听播放子进程；mutagen = 试听进度条时长探测（可选，缺省自动降级）
+gui-qt = [
+    "PyQt5>=5.15",
+    "pygame>=2.5",
+    "mutagen>=1.47",
+    "selenium>=4.15",
+]
+
+[tool.setuptools]
+py-modules = ["chartunes"]
