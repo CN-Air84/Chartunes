@@ -7,9 +7,9 @@
 
 ---
 
-如有疑问LD喊我了：
+如有疑问LD喊我：
 
-linux.do/u/air84
+https://linux.do/u/air84
 
 ---
 
